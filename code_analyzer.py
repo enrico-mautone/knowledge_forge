@@ -167,6 +167,52 @@ class PythonAnalyzer(BaseAnalyzer):
                 out.append({"type": "from", "module": base, "name": name, "alias": alias})
         return out
 
+    def _extract_instance_fields_from_method(self, method_node: Node, src: bytes) -> List[FieldInfo]:
+        """Extract self.* attribute assignments from a method body (e.g., __init__)."""
+        fields: List[FieldInfo] = []
+        body = method_node.child_by_field_name("body")
+        if not body:
+            return fields
+
+        def walk_for_self_assignments(n: Node) -> None:
+            if n.type == "assignment":
+                left = n.child_by_field_name("left")
+                if left and left.type == "attribute":
+                    # Check if it's self.something
+                    obj = left.child_by_field_name("object")
+                    attr = left.child_by_field_name("attribute")
+                    if obj and attr:
+                        obj_name = self._text(src, obj)
+                        if obj_name == "self":
+                            field_name = self._text(src, attr)
+                            # Try to infer type from right side or annotation
+                            field_type = None
+                            right = n.child_by_field_name("right")
+                            if right:
+                                if right.type == "string":
+                                    field_type = "str"
+                                elif right.type == "integer":
+                                    field_type = "int"
+                                elif right.type == "float":
+                                    field_type = "float"
+                                elif right.type == "true" or right.type == "false":
+                                    field_type = "bool"
+                                elif right.type == "list":
+                                    field_type = "list"
+                                elif right.type == "dictionary":
+                                    field_type = "dict"
+                                elif right.type == "call":
+                                    # Try to get the type from the call
+                                    func = right.child_by_field_name("function")
+                                    if func:
+                                        field_type = self._text(src, func)
+                            fields.append(FieldInfo(name=field_name, type=field_type))
+            for child in n.children:
+                walk_for_self_assignments(child)
+
+        walk_for_self_assignments(body)
+        return fields
+
     def _parse_class(self, node: Node, src: bytes, module: str) -> ClassInfo:
         name = self._text(src, node.child_by_field_name("name"))
         methods: List[FunctionInfo] = []
@@ -179,6 +225,9 @@ class PythonAnalyzer(BaseAnalyzer):
                 if n.type == "function_definition":
                     method_info = self._parse_function(n, src, module, class_name=name)
                     methods.append(method_info)
+                    # Extract instance fields from __init__ and other methods
+                    instance_fields = self._extract_instance_fields_from_method(n, src)
+                    fields.extend(instance_fields)
                 elif n.type in ("expression_statement", "assignment"):
                     field_info = self._parse_field_from_node(n, src)
                     if field_info:
