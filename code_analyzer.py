@@ -3,7 +3,6 @@ import argparse
 import json
 import os
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -246,6 +245,7 @@ def main() -> None:
     dep_graph = nx.DiGraph()
     call_graph = nx.DiGraph()
     module_graph = nx.Graph()
+    internal_modules = set(analyzer.modules.keys())
 
     all_functions: List[FunctionInfo] = []
     all_classes: List[ClassInfo] = []
@@ -258,9 +258,17 @@ def main() -> None:
         all_classes.extend(m.classes)
         globals_out.extend({"module": module, "name": g} for g in m.globals)
         for imp in m.imports:
-            target = imp["module"]
-            dep_graph.add_edge(module, target)
-            module_graph.add_edge(module, target)
+            # Keep module-level dependency graph focused on internal repository modules.
+            # This prevents explosive graph growth from stdlib/3rd-party imports.
+            raw_target = imp["module"]
+            target = raw_target
+            if target not in internal_modules:
+                candidate = target.split(".")[0]
+                if candidate in internal_modules:
+                    target = candidate
+            if target in internal_modules:
+                dep_graph.add_edge(module, target)
+                module_graph.add_edge(module, target)
 
     for fn in all_functions:
         call_graph.add_node(fn.qualified_name)
@@ -306,7 +314,6 @@ def main() -> None:
         if not fn.name.startswith("_"):
             api_surface.append(fn.qualified_name)
 
-    complexity_list = [{"function": f.qualified_name, "complexity": f.complexity, "nesting": f.nesting} for f in all_functions]
     fan_map = {x["function"]: x for x in fan}
     hotspots = [f.qualified_name for f in all_functions if f.complexity >= 8 and fan_map[f.qualified_name]["fan_in"] >= 2]
 
@@ -331,7 +338,17 @@ def main() -> None:
     coverage = len(reachable) / len(all_functions) if all_functions else 0.0
 
     deg = nx.degree_centrality(module_graph) if module_graph.nodes else {}
-    btw = nx.betweenness_centrality(module_graph) if module_graph.nodes else {}
+    if module_graph.nodes:
+        node_count = module_graph.number_of_nodes()
+        # Exact betweenness is O(V*E) and becomes very slow on large graphs.
+        # Use approximation with sampling when the graph is large.
+        if node_count > 300:
+            k = min(100, node_count)
+            btw = nx.betweenness_centrality(module_graph, k=k, seed=42)
+        else:
+            btw = nx.betweenness_centrality(module_graph)
+    else:
+        btw = {}
     centrality = [{"module": m, "score": round((deg.get(m, 0.0) + btw.get(m, 0.0)) / 2, 4)} for m in module_graph.nodes]
 
     refactoring = []
