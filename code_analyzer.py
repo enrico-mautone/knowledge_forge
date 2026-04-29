@@ -12,8 +12,10 @@ from tqdm import tqdm
 from tree_sitter import Node, Parser
 from tree_sitter_language_pack import get_language
 
-EXCLUDED_DIRS = {"venv", ".git", "__pycache__", "node_modules"}
+EXCLUDED_DIRS = {"venv", ".git", "__pycache__", "node_modules", "dist", "build"}
 PY_EXTENSIONS = {".py"}
+TS_EXTENSIONS = {".ts", ".tsx"}
+ALL_EXTENSIONS = PY_EXTENSIONS | TS_EXTENSIONS
 ENTITY_HINTS = {"user", "order", "payment", "invoice", "customer", "product", "cart", "account"}
 
 
@@ -58,10 +60,14 @@ class ModuleInfo:
     entrypoint: bool = False
 
 
-class PythonAnalyzer:
-    def __init__(self, repo_path: Path):
+class BaseAnalyzer:
+    """Base class for language-specific analyzers."""
+
+    def __init__(self, repo_path: Path, language: str, extensions: Set[str]):
         self.repo_path = repo_path
-        self.parser = Parser(get_language("python"))
+        self.language = language
+        self.extensions = extensions
+        self.parser = Parser(get_language(language))
         self.modules: Dict[str, ModuleInfo] = {}
         self.symbol_functions: Dict[str, str] = {}
         self.symbol_classes: Dict[str, str] = {}
@@ -72,15 +78,15 @@ class PythonAnalyzer:
             dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
             for fname in filenames:
                 path = Path(root) / fname
-                if path.suffix in PY_EXTENSIONS:
+                if path.suffix in self.extensions:
                     files.append(path)
         return sorted(files)
 
     def module_name_from_path(self, path: Path) -> str:
         rel = path.relative_to(self.repo_path)
         parts = list(rel.parts)
-        parts[-1] = parts[-1].replace(".py", "")
-        if parts[-1] == "__init__":
+        parts[-1] = parts[-1].replace(".py", "").replace(".ts", "").replace(".tsx", "")
+        if parts[-1] in ("__init__", "index"):
             parts = parts[:-1]
         return ".".join([p for p in parts if p]) or path.stem
 
@@ -88,7 +94,10 @@ class PythonAnalyzer:
         return src[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
 
     def parse_repo(self) -> None:
-        for file_path in tqdm(self.scan_files(), desc="Parsing files"):
+        files = self.scan_files()
+        if not files:
+            return
+        for file_path in tqdm(files, desc=f"Parsing {self.language} files"):
             src = file_path.read_bytes()
             tree = self.parser.parse(src)
             mod = self.module_name_from_path(file_path)
@@ -104,6 +113,16 @@ class PythonAnalyzer:
                 q = f"{module}.{c.name}"
                 self.symbol_classes[q] = module
                 self.symbol_classes[c.name] = module
+
+    def _walk_module(self, root: Node, src: bytes, mod_info: ModuleInfo) -> None:
+        raise NotImplementedError("Subclasses must implement _walk_module")
+
+
+class PythonAnalyzer(BaseAnalyzer):
+    """Analyzer for Python source files."""
+
+    def __init__(self, repo_path: Path):
+        super().__init__(repo_path, "python", PY_EXTENSIONS)
 
     def _walk_module(self, root: Node, src: bytes, mod_info: ModuleInfo) -> None:
         for child in root.children:
@@ -304,6 +323,161 @@ class PythonAnalyzer:
         return "__name__" in txt and "__main__" in txt
 
 
+class TypeScriptAnalyzer(BaseAnalyzer):
+    """Analyzer for TypeScript source files."""
+
+    def __init__(self, repo_path: Path):
+        super().__init__(repo_path, "typescript", TS_EXTENSIONS)
+
+    def _walk_module(self, root: Node, src: bytes, mod_info: ModuleInfo) -> None:
+        for child in root.children:
+            if child.type in ("function_declaration", "function", "method_definition"):
+                func_info = self._parse_ts_function(child, src, mod_info.name)
+                if func_info:
+                    mod_info.functions.append(func_info)
+            elif child.type in ("class_declaration", "class"):
+                mod_info.classes.append(self._parse_ts_class(child, src, mod_info.name))
+            elif child.type == "interface_declaration":
+                mod_info.classes.append(self._parse_ts_interface(child, src, mod_info.name))
+            elif child.type == "type_alias_declaration":
+                mod_info.globals.append(self._text(src, child))
+            elif child.type == "import_statement":
+                mod_info.imports.extend(self._parse_ts_import(child, src))
+            elif child.type == "comment":
+                mod_info.comments.append(self._text(src, child))
+
+    def _parse_ts_import(self, node: Node, src: bytes) -> List[Dict[str, str]]:
+        text = self._text(src, node).strip()
+        out: List[Dict[str, str]] = []
+        if text.startswith("import "):
+            if " from " in text:
+                # import { x } from 'module' or import x from 'module'
+                parts = text.split(" from ", 1)
+                module_part = parts[1].strip().strip(";'\"")
+                import_part = parts[0].replace("import ", "", 1).strip()
+                out.append({"type": "import", "module": module_part, "name": import_part, "alias": ""})
+            else:
+                # import 'module'
+                module_part = text.replace("import ", "", 1).strip().strip(";'\"")
+                out.append({"type": "import", "module": module_part, "name": "", "alias": ""})
+        return out
+
+    def _parse_ts_function(self, node: Node, src: bytes, module: str) -> Optional[FunctionInfo]:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return None
+        name = self._text(src, name_node)
+
+        params: List[Dict[str, Optional[str]]] = []
+        params_node = node.child_by_field_name("parameters")
+        if params_node:
+            for param in params_node.children:
+                if param.type == "formal_parameter":
+                    param_name_node = param.child_by_field_name("name")
+                    param_type_node = param.child_by_field_name("type")
+                    if param_name_node:
+                        p_name = self._text(src, param_name_node)
+                        p_type = self._text(src, param_type_node) if param_type_node else None
+                        params.append({"name": p_name, "type": p_type})
+
+        return_type_node = node.child_by_field_name("return_type")
+        return_type = self._text(src, return_type_node) if return_type_node else None
+
+        return FunctionInfo(
+            name=name,
+            qualified_name=f"{module}.{name}",
+            module=module,
+            params=params,
+            return_type=return_type
+        )
+
+    def _parse_ts_class(self, node: Node, src: bytes, module: str) -> ClassInfo:
+        name_node = node.child_by_field_name("name")
+        name = self._text(src, name_node) if name_node else "Unknown"
+
+        methods: List[FunctionInfo] = []
+        fields: List[FieldInfo] = []
+        class_comments: List[str] = []
+
+        body = node.child_by_field_name("body")
+        if body:
+            for i, n in enumerate(body.children):
+                if n.type in ("method_definition", "function_declaration"):
+                    method_info = self._parse_ts_function(n, src, module)
+                    if method_info:
+                        method_info.qualified_name = f"{module}.{name}.{method_info.name}"
+                        methods.append(method_info)
+                elif n.type == "property_definition":
+                    field_info = self._parse_ts_property(n, src)
+                    if field_info:
+                        if i > 0 and body.children[i - 1].type == "comment":
+                            field_info.comments.append(
+                                self._text(src, body.children[i - 1]).strip("// /*")
+                            )
+                        fields.append(field_info)
+                elif n.type == "comment":
+                    class_comments.append(self._text(src, n).strip("// /*"))
+
+        return ClassInfo(name=name, module=module, methods=methods, fields=fields, comments=class_comments)
+
+    def _parse_ts_interface(self, node: Node, src: bytes, module: str) -> ClassInfo:
+        """Parse TypeScript interface as a class-like structure."""
+        name_node = node.child_by_field_name("name")
+        name = self._text(src, name_node) if name_node else "UnknownInterface"
+
+        fields: List[FieldInfo] = []
+        methods: List[FunctionInfo] = []
+
+        body = node.child_by_field_name("body")
+        if body:
+            for n in body.children:
+                if n.type == "property_signature":
+                    field_info = self._parse_ts_property(n, src)
+                    if field_info:
+                        fields.append(field_info)
+                elif n.type == "method_signature":
+                    method_info = self._parse_ts_method_signature(n, src, module)
+                    if method_info:
+                        method_info.qualified_name = f"{module}.{name}.{method_info.name}"
+                        methods.append(method_info)
+
+        return ClassInfo(name=name, module=module, methods=methods, fields=fields, comments=[])
+
+    def _parse_ts_property(self, node: Node, src: bytes) -> Optional[FieldInfo]:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return None
+        name = self._text(src, name_node)
+
+        type_node = node.child_by_field_name("type")
+        field_type = self._text(src, type_node) if type_node else None
+
+        return FieldInfo(name=name, type=field_type)
+
+    def _parse_ts_method_signature(self, node: Node, src: bytes, module: str) -> Optional[FunctionInfo]:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return None
+        name = self._text(src, name_node)
+
+        params: List[Dict[str, Optional[str]]] = []
+        params_node = node.child_by_field_name("parameters")
+        if params_node:
+            for param in params_node.children:
+                if param.type == "parameter":
+                    param_name_node = param.child_by_field_name("name")
+                    param_type_node = param.child_by_field_name("type")
+                    if param_name_node:
+                        p_name = self._text(src, param_name_node)
+                        p_type = self._text(src, param_type_node) if param_type_node else None
+                        params.append({"name": p_name, "type": p_type})
+
+        return_type_node = node.child_by_field_name("return_type")
+        return_type = self._text(src, return_type_node) if return_type_node else None
+
+        return FunctionInfo(name=name, qualified_name="", module=module, params=params, return_type=return_type)
+
+
 def build_structure_tree(repo_path: Path) -> Dict:
     tree: Dict = {}
     for root, dirs, files in os.walk(repo_path):
@@ -313,7 +487,7 @@ def build_structure_tree(repo_path: Path) -> Dict:
         for part in rel.parts:
             cur = cur.setdefault(part, {})
         for f in files:
-            if Path(f).suffix in PY_EXTENSIONS:
+            if Path(f).suffix in ALL_EXTENSIONS:
                 cur.setdefault(f, {})
     return tree
 
@@ -331,6 +505,27 @@ def _module_root(module_name: str) -> str:
     return module_name.split(".")[0]
 
 
+def merge_analyzers(py_analyzer: PythonAnalyzer, ts_analyzer: TypeScriptAnalyzer) -> Dict:
+    """Merge results from Python and TypeScript analyzers."""
+    all_modules = {}
+    all_modules.update(py_analyzer.modules)
+    all_modules.update(ts_analyzer.modules)
+
+    all_symbol_functions = {}
+    all_symbol_functions.update(py_analyzer.symbol_functions)
+    all_symbol_functions.update(ts_analyzer.symbol_functions)
+
+    all_symbol_classes = {}
+    all_symbol_classes.update(py_analyzer.symbol_classes)
+    all_symbol_classes.update(ts_analyzer.symbol_classes)
+
+    return {
+        "modules": all_modules,
+        "symbol_functions": all_symbol_functions,
+        "symbol_classes": all_symbol_classes,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Static code intelligence engine (no LLM)")
     ap.add_argument("repo_path")
@@ -341,19 +536,30 @@ def main() -> None:
     output_dir = Path(args.output_path) if args.output_path else Path(f"output_{repo_path.name}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    analyzer = PythonAnalyzer(repo_path)
-    analyzer.parse_repo()
+    # Run Python analyzer
+    py_analyzer = PythonAnalyzer(repo_path)
+    py_analyzer.parse_repo()
+
+    # Run TypeScript analyzer
+    ts_analyzer = TypeScriptAnalyzer(repo_path)
+    ts_analyzer.parse_repo()
+
+    # Merge results
+    merged = merge_analyzers(py_analyzer, ts_analyzer)
+    analyzer_modules = merged["modules"]
+    analyzer_symbol_functions = merged["symbol_functions"]
+    analyzer_symbol_classes = merged["symbol_classes"]
 
     dep_graph = nx.DiGraph()
     call_graph = nx.DiGraph()
     module_graph = nx.Graph()
-    internal_modules = set(analyzer.modules.keys())
+    internal_modules = set(analyzer_modules.keys())
 
     all_functions: List[FunctionInfo] = []
     all_classes: List[ClassInfo] = []
     globals_out: List[Dict[str, str]] = []
 
-    for module, m in analyzer.modules.items():
+    for module, m in analyzer_modules.items():
         dep_graph.add_node(module)
         module_graph.add_node(module)
         all_functions.extend(m.functions)
@@ -377,16 +583,16 @@ def main() -> None:
 
     for fn in all_functions:
         caller = fn.qualified_name
-        mod_import_alias = {i["alias"] or i["name"]: i["module"] for i in analyzer.modules[fn.module].imports}
+        mod_import_alias = {i["alias"] or i["name"]: i["module"] for i in analyzer_modules[fn.module].imports}
         for raw_call in fn.calls:
             base = raw_call.split("(")[0].strip()
             callee = None
             if base in mod_import_alias:
                 callee = mod_import_alias[base]
-            elif f"{fn.module}.{base}" in analyzer.symbol_functions:
+            elif f"{fn.module}.{base}" in analyzer_symbol_functions:
                 callee = f"{fn.module}.{base}"
-            elif base in analyzer.symbol_functions:
-                callee = f"{analyzer.symbol_functions[base]}.{base.split('.')[-1]}"
+            elif base in analyzer_symbol_functions:
+                callee = f"{analyzer_symbol_functions[base]}.{base.split('.')[-1]}"
             else:
                 parts = base.split(".")
                 if len(parts) >= 2:
@@ -410,7 +616,7 @@ def main() -> None:
     clusters = [{"cluster_id": i + 1, "modules": sorted(list(comp))} for i, comp in enumerate(nx.connected_components(module_graph))]
 
     entrypoints = []
-    for mod, m in analyzer.modules.items():
+    for mod, m in analyzer_modules.items():
         impmods = {i["module"].lower() for i in m.imports}
         if m.entrypoint or any(x in impmods for x in ["argparse", "click", "fastapi", "flask"]):
             entrypoints.append(mod)
@@ -426,7 +632,7 @@ def main() -> None:
 
     business_entities = sorted({c.name for c in all_classes if any(h in c.name.lower() for h in ENTITY_HINTS)} | {g["name"] for g in globals_out if any(h in g["name"].lower() for h in ENTITY_HINTS)})
 
-    module_types = [{"module": m, "type": classify_module(m)} for m in analyzer.modules]
+    module_types = [{"module": m, "type": classify_module(m)} for m in analyzer_modules]
     business_logic = [f.qualified_name for f in all_functions if classify_module(f.module) != "utility" and fan_map[f.qualified_name]["fan_out"] >= 2 and any(e.lower() in " ".join(f.calls).lower() for e in business_entities)]
 
     uml = {
@@ -479,7 +685,7 @@ def main() -> None:
             if base in mod_import_alias:
                 if mod_import_alias[base].split(".")[0] in internal_modules:
                     internal_calls.append(call)
-            elif call.split(".")[0] in internal_modules or call in analyzer.symbol_functions:
+            elif call.split(".")[0] in internal_modules or call in analyzer_symbol_functions:
                 internal_calls.append(call)
         return internal_calls
 
@@ -489,9 +695,9 @@ def main() -> None:
             "path": str(repo_path),
             "structure": build_structure_tree(repo_path),
         },
-        "modules": [{"name": m.name, "path": m.path, "imports": _filter_internal_imports(m.imports), "comments": m.comments} for m in analyzer.modules.values()],
+        "modules": [{"name": m.name, "path": m.path, "imports": _filter_internal_imports(m.imports), "comments": m.comments} for m in analyzer_modules.values()],
         "symbols": {
-            "functions": [{**f.__dict__, "calls": _filter_internal_calls(f.calls, analyzer.modules[f.module].imports)} for f in all_functions],
+            "functions": [{**f.__dict__, "calls": _filter_internal_calls(f.calls, analyzer_modules[f.module].imports)} for f in all_functions],
             "classes": [{"name": c.name, "module": c.module, "fields": [{"name": f.name, "type": f.type, "comments": f.comments} for f in c.fields], "methods": [m.__dict__ for m in c.methods], "comments": c.comments} for c in all_classes],
             "globals": globals_out,
         },
