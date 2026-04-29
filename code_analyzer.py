@@ -31,10 +31,19 @@ class FunctionInfo:
 
 
 @dataclass
+class FieldInfo:
+    name: str
+    type: Optional[str] = None
+    comments: List[str] = field(default_factory=list)
+
+
+@dataclass
 class ClassInfo:
     name: str
     module: str
     methods: List[FunctionInfo] = field(default_factory=list)
+    fields: List[FieldInfo] = field(default_factory=list)
+    comments: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -142,13 +151,76 @@ class PythonAnalyzer:
     def _parse_class(self, node: Node, src: bytes, module: str) -> ClassInfo:
         name = self._text(src, node.child_by_field_name("name"))
         methods: List[FunctionInfo] = []
+        fields: List[FieldInfo] = []
+        class_comments: List[str] = []
+
         body = node.child_by_field_name("body")
         if body:
-            for n in body.children:
+            for i, n in enumerate(body.children):
                 if n.type == "function_definition":
                     method_info = self._parse_function(n, src, module, class_name=name)
                     methods.append(method_info)
-        return ClassInfo(name=name, module=module, methods=methods)
+                elif n.type == "expression_statement":
+                    field_info = self._parse_field(n, src)
+                    if field_info:
+                        # Look for preceding comments
+                        if i > 0 and body.children[i - 1].type == "comment":
+                            field_info.comments.append(
+                                self._text(src, body.children[i - 1]).strip("# ")
+                            )
+                        fields.append(field_info)
+                elif n.type == "comment":
+                    class_comments.append(self._text(src, n).strip("# "))
+
+        return ClassInfo(name=name, module=module, methods=methods, fields=fields, comments=class_comments)
+
+    def _parse_field(self, node: Node, src: bytes) -> Optional[FieldInfo]:
+        """Parse a field assignment from class body."""
+        if node.type != "expression_statement":
+            return None
+
+        # Handle assignment: x = value or x: Type = value or x: Type
+        assignment = node.child_by_field_name("expression")
+        if assignment is None and len(node.children) > 0:
+            assignment = node.children[0]
+
+        if assignment is None:
+            return None
+
+        if assignment.type == "assignment":
+            left = assignment.child_by_field_name("left")
+            type_node = assignment.child_by_field_name("type")
+
+            if left is None:
+                return None
+
+            field_name = None
+            field_type = None
+
+            if left.type == "identifier":
+                field_name = self._text(src, left)
+            elif left.type == "typed_default_parameter":
+                name_node = left.child_by_field_name("name")
+                if name_node:
+                    field_name = self._text(src, name_node)
+                type_node = left.child_by_field_name("type")
+
+            if type_node:
+                field_type = self._text(src, type_node)
+
+            if field_name:
+                return FieldInfo(name=field_name, type=field_type)
+
+        elif assignment.type == "annotated_assignment":
+            left = assignment.child_by_field_name("left")
+            type_node = assignment.child_by_field_name("type")
+
+            if left and left.type == "identifier":
+                field_name = self._text(src, left)
+                field_type = self._text(src, type_node) if type_node else None
+                return FieldInfo(name=field_name, type=field_type)
+
+        return None
 
     def _parse_function(self, node: Node, src: bytes, module: str, class_name: Optional[str] = None) -> FunctionInfo:
         name = self._text(src, node.child_by_field_name("name"))
@@ -360,7 +432,7 @@ def main() -> None:
     business_logic = [f.qualified_name for f in all_functions if classify_module(f.module) != "utility" and fan_map[f.qualified_name]["fan_out"] >= 2 and any(e.lower() in " ".join(f.calls).lower() for e in business_entities)]
 
     uml = {
-        "classes": [{"name": c.name, "module": c.module, "methods": [{"name": m.name, "params": m.params, "return_type": m.return_type} for m in c.methods]} for c in all_classes],
+        "classes": [{"name": c.name, "module": c.module, "fields": [{"name": f.name, "type": f.type, "comments": f.comments} for f in c.fields], "methods": [{"name": m.name, "params": m.params, "return_type": m.return_type} for m in c.methods], "comments": c.comments} for c in all_classes],
         "relations": [{"from": u, "to": v, "type": "module_dep"} for u, v in dep_graph.edges],
     }
 
@@ -422,7 +494,7 @@ def main() -> None:
         "modules": [{"name": m.name, "path": m.path, "imports": _filter_internal_imports(m.imports), "comments": m.comments} for m in analyzer.modules.values()],
         "symbols": {
             "functions": [{**f.__dict__, "calls": _filter_internal_calls(f.calls, analyzer.modules[f.module].imports)} for f in all_functions],
-            "classes": [{"name": c.name, "module": c.module, "methods": [m.__dict__ for m in c.methods]} for c in all_classes],
+            "classes": [{"name": c.name, "module": c.module, "fields": [{"name": f.name, "type": f.type, "comments": f.comments} for f in c.fields], "methods": [m.__dict__ for m in c.methods], "comments": c.comments} for c in all_classes],
             "globals": globals_out,
         },
         "business_entities": business_entities,
