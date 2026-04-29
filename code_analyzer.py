@@ -229,6 +229,10 @@ def classify_module(module: str) -> str:
     return "core"
 
 
+def _module_root(module_name: str) -> str:
+    return module_name.split(".")[0]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Static code intelligence engine (no LLM)")
     ap.add_argument("repo_path")
@@ -293,6 +297,10 @@ def main() -> None:
                     if lhs in mod_import_alias:
                         callee = f"{mod_import_alias[lhs]}.{rhs}"
             if callee:
+                # Keep the call graph constrained to application source modules only.
+                callee_module = ".".join(callee.split(".")[:-1]) if "." in callee else callee
+                if callee_module not in internal_modules and _module_root(callee_module) not in internal_modules:
+                    continue
                 call_graph.add_edge(caller, callee)
 
     dead_code = [n for n in call_graph.nodes if call_graph.in_degree(n) == 0]
@@ -314,6 +322,7 @@ def main() -> None:
         if not fn.name.startswith("_"):
             api_surface.append(fn.qualified_name)
 
+    complexity_list = [{"function": f.qualified_name, "complexity": f.complexity, "nesting": f.nesting} for f in all_functions]
     fan_map = {x["function"]: x for x in fan}
     hotspots = [f.qualified_name for f in all_functions if f.complexity >= 8 and fan_map[f.qualified_name]["fan_in"] >= 2]
 
