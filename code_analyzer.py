@@ -554,23 +554,67 @@ def _module_root(module_name: str) -> str:
     return module_name.split(".")[0]
 
 
-def build_hierarchical_modules(analyzer_modules: Dict[str, ModuleInfo]) -> Dict:
-    """Organizza i moduli in una struttura gerarchica basata sui path."""
+def build_hierarchical_modules(
+    analyzer_modules: Dict[str, ModuleInfo],
+    filtered_calls: Dict[str, List[str]]
+) -> Dict:
+    """Organizza i moduli in una struttura gerarchica basata sui path con dati completi."""
     tree: Dict = {}
     for module_name, module_info in analyzer_modules.items():
         path_parts = module_info.path.replace("\\", "/").split("/")
         cur = tree
         for i, part in enumerate(path_parts):
             if i == len(path_parts) - 1:  # Ultimo elemento (file)
+                # Costruisci funzioni con calls filtrati
+                functions = []
+                for f in module_info.functions:
+                    func_data = {
+                        "name": f.name,
+                        "qualified_name": f.qualified_name,
+                        "params": f.params,
+                        "return_type": f.return_type,
+                        "docstring": f.docstring,
+                        "calls": filtered_calls.get(f.qualified_name, []),
+                        "complexity": f.complexity,
+                        "nesting": f.nesting,
+                    }
+                    functions.append(func_data)
+
+                # Costruisci classi con metodi completi
+                classes = []
+                for c in module_info.classes:
+                    methods = []
+                    for m in c.methods:
+                        method_data = {
+                            "name": m.name,
+                            "qualified_name": m.qualified_name,
+                            "params": m.params,
+                            "return_type": m.return_type,
+                            "docstring": m.docstring,
+                            "calls": filtered_calls.get(m.qualified_name, []),
+                            "complexity": m.complexity,
+                            "nesting": m.nesting,
+                        }
+                        methods.append(method_data)
+
+                    class_data = {
+                        "name": c.name,
+                        "fields": [{"name": f.name, "type": f.type, "comments": f.comments} for f in c.fields],
+                        "methods": methods,
+                        "comments": c.comments,
+                    }
+                    classes.append(class_data)
+
                 cur[part] = {
                     "_type": "file",
-                    "name": module_info.name,
+                    "module": module_info.name,
                     "path": module_info.path,
                     "imports": module_info.imports,
                     "comments": module_info.comments,
-                    "functions": [{"name": f.name, "params": f.params, "return_type": f.return_type} for f in module_info.functions],
-                    "classes": [{"name": c.name, "fields": [{"name": f.name, "type": f.type} for f in c.fields], "methods": [{"name": m.name, "params": m.params, "return_type": m.return_type} for m in c.methods]} for c in module_info.classes],
+                    "functions": functions,
+                    "classes": classes,
                     "globals": module_info.globals,
+                    "entrypoint": module_info.entrypoint,
                 }
             else:  # Cartella
                 if part not in cur:
@@ -763,22 +807,31 @@ def main() -> None:
                 internal_calls.append(call)
         return internal_calls
 
-    hierarchical_modules = build_hierarchical_modules(analyzer_modules)
+    # Pre-calcola le calls filtrate per ogni funzione
+    filtered_calls: Dict[str, List[str]] = {}
+    for f in all_functions:
+        filtered_calls[f.qualified_name] = _filter_internal_calls(f.calls, analyzer_modules[f.module].imports)
+
+    # Costruisci struttura gerarchica completa
+    tree = build_hierarchical_modules(analyzer_modules, filtered_calls)
+
+    # Raccogli dati di riepilogo
+    total_functions = len(all_functions)
+    total_classes = len(all_classes)
+    total_modules = len(analyzer_modules)
 
     output = {
         "project": {
             "name": repo_path.name,
             "path": str(repo_path),
-            "structure": build_structure_tree(repo_path),
-            "modules_hierarchical": hierarchical_modules,
+            "tree": tree,
         },
-        "modules_flat": [{"name": m.name, "path": m.path, "imports": _filter_internal_imports(m.imports), "comments": m.comments} for m in analyzer_modules.values()],
-        "symbols": {
-            "functions": [{**f.__dict__, "calls": _filter_internal_calls(f.calls, analyzer_modules[f.module].imports)} for f in all_functions],
-            "classes": [{"name": c.name, "module": c.module, "fields": [{"name": f.name, "type": f.type, "comments": f.comments} for f in c.fields], "methods": [m.__dict__ for m in c.methods], "comments": c.comments} for c in all_classes],
-            "globals": globals_out,
+        "summary": {
+            "total_modules": total_modules,
+            "total_functions": total_functions,
+            "total_classes": total_classes,
+            "business_entities": business_entities,
         },
-        "business_entities": business_entities,
         "graphs": {
             "call_graph": [[u, v] for u, v in call_graph.edges],
             "dependency_graph": [[u, v] for u, v in dep_graph.edges],
