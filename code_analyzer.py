@@ -505,6 +505,31 @@ def _module_root(module_name: str) -> str:
     return module_name.split(".")[0]
 
 
+def build_hierarchical_modules(analyzer_modules: Dict[str, ModuleInfo]) -> Dict:
+    """Organizza i moduli in una struttura gerarchica basata sui path."""
+    tree: Dict = {}
+    for module_name, module_info in analyzer_modules.items():
+        path_parts = module_info.path.replace("\\", "/").split("/")
+        cur = tree
+        for i, part in enumerate(path_parts):
+            if i == len(path_parts) - 1:  # Ultimo elemento (file)
+                cur[part] = {
+                    "_type": "file",
+                    "name": module_info.name,
+                    "path": module_info.path,
+                    "imports": module_info.imports,
+                    "comments": module_info.comments,
+                    "functions": [{"name": f.name, "params": f.params, "return_type": f.return_type} for f in module_info.functions],
+                    "classes": [{"name": c.name, "fields": [{"name": f.name, "type": f.type} for f in c.fields], "methods": [{"name": m.name, "params": m.params, "return_type": m.return_type} for m in c.methods]} for c in module_info.classes],
+                    "globals": module_info.globals,
+                }
+            else:  # Cartella
+                if part not in cur:
+                    cur[part] = {"_type": "directory"}
+                cur = cur[part]
+    return tree
+
+
 def merge_analyzers(py_analyzer: PythonAnalyzer, ts_analyzer: TypeScriptAnalyzer) -> Dict:
     """Merge results from Python and TypeScript analyzers."""
     all_modules = {}
@@ -689,13 +714,16 @@ def main() -> None:
                 internal_calls.append(call)
         return internal_calls
 
+    hierarchical_modules = build_hierarchical_modules(analyzer_modules)
+
     output = {
         "project": {
             "name": repo_path.name,
             "path": str(repo_path),
             "structure": build_structure_tree(repo_path),
+            "modules_hierarchical": hierarchical_modules,
         },
-        "modules": [{"name": m.name, "path": m.path, "imports": _filter_internal_imports(m.imports), "comments": m.comments} for m in analyzer_modules.values()],
+        "modules_flat": [{"name": m.name, "path": m.path, "imports": _filter_internal_imports(m.imports), "comments": m.comments} for m in analyzer_modules.values()],
         "symbols": {
             "functions": [{**f.__dict__, "calls": _filter_internal_calls(f.calls, analyzer_modules[f.module].imports)} for f in all_functions],
             "classes": [{"name": c.name, "module": c.module, "fields": [{"name": f.name, "type": f.type, "comments": f.comments} for f in c.fields], "methods": [m.__dict__ for m in c.methods], "comments": c.comments} for c in all_classes],
