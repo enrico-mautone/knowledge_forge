@@ -159,18 +159,24 @@ class PythonAnalyzer:
                 if ch.type == "identifier":
                     params.append({"name": self._text(src, ch), "type": None})
                 elif ch.type == "typed_parameter":
-                    p_name = self._text(src, ch.child_by_field_name("name"))
+                    p_name_node = ch.child_by_field_name("name")
+                    p_name = self._text(src, p_name_node) if p_name_node else None
                     p_type = ch.child_by_field_name("type")
                     type_str = self._text(src, p_type) if p_type else None
-                    params.append({"name": p_name, "type": type_str})
+                    if p_name:
+                        params.append({"name": p_name, "type": type_str})
                 elif ch.type == "default_parameter":
-                    p_name = self._text(src, ch.child_by_field_name("name"))
-                    params.append({"name": p_name, "type": None})
+                    p_name_node = ch.child_by_field_name("name")
+                    p_name = self._text(src, p_name_node) if p_name_node else None
+                    if p_name:
+                        params.append({"name": p_name, "type": None})
                 elif ch.type == "typed_default_parameter":
-                    p_name = self._text(src, ch.child_by_field_name("name"))
+                    p_name_node = ch.child_by_field_name("name")
+                    p_name = self._text(src, p_name_node) if p_name_node else None
                     p_type = ch.child_by_field_name("type")
                     type_str = self._text(src, p_type) if p_type else None
-                    params.append({"name": p_name, "type": type_str})
+                    if p_name:
+                        params.append({"name": p_name, "type": type_str})
                 elif ch.type == "list_splat_pattern":
                     params.append({"name": self._text(src, ch), "type": None})
                 elif ch.type == "dictionary_splat_pattern":
