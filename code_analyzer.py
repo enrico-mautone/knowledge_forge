@@ -160,8 +160,8 @@ class PythonAnalyzer:
                 if n.type == "function_definition":
                     method_info = self._parse_function(n, src, module, class_name=name)
                     methods.append(method_info)
-                elif n.type == "expression_statement":
-                    field_info = self._parse_field(n, src)
+                elif n.type in ("expression_statement", "assignment"):
+                    field_info = self._parse_field_from_node(n, src)
                     if field_info:
                         # Look for preceding comments
                         if i > 0 and body.children[i - 1].type == "comment":
@@ -174,51 +174,49 @@ class PythonAnalyzer:
 
         return ClassInfo(name=name, module=module, methods=methods, fields=fields, comments=class_comments)
 
+    def _parse_field_from_node(self, node: Node, src: bytes) -> Optional[FieldInfo]:
+        """Parse a field from either expression_statement or assignment node."""
+        if node.type == "expression_statement":
+            return self._parse_field(node, src)
+        elif node.type == "assignment":
+            # Direct assignment node (e.g., in class body)
+            return self._parse_direct_assignment(node, src)
+        return None
+
+    def _parse_direct_assignment(self, node: Node, src: bytes) -> Optional[FieldInfo]:
+        """Parse an assignment node directly (not wrapped in expression_statement)."""
+        field_name = None
+        field_type = None
+
+        # Structure: identifier ':' type ['=' value]
+        for child in node.children:
+            if child.type == "identifier":
+                field_name = self._text(src, child)
+            elif child.type == "type":
+                field_type = self._text(src, child)
+
+        if field_name:
+            return FieldInfo(name=field_name, type=field_type)
+        return None
+
     def _parse_field(self, node: Node, src: bytes) -> Optional[FieldInfo]:
-        """Parse a field assignment from class body."""
+        """Parse a field assignment from expression_statement node."""
         if node.type != "expression_statement":
             return None
 
-        # Handle assignment: x = value or x: Type = value or x: Type
-        assignment = node.child_by_field_name("expression")
-        if assignment is None and len(node.children) > 0:
-            assignment = node.children[0]
+        # Get the actual expression child
+        expr = None
+        for child in node.children:
+            if child.type not in ("comment", "newline", "indent", "dedent"):
+                expr = child
+                break
 
-        if assignment is None:
+        if expr is None:
             return None
 
-        if assignment.type == "assignment":
-            left = assignment.child_by_field_name("left")
-            type_node = assignment.child_by_field_name("type")
-
-            if left is None:
-                return None
-
-            field_name = None
-            field_type = None
-
-            if left.type == "identifier":
-                field_name = self._text(src, left)
-            elif left.type == "typed_default_parameter":
-                name_node = left.child_by_field_name("name")
-                if name_node:
-                    field_name = self._text(src, name_node)
-                type_node = left.child_by_field_name("type")
-
-            if type_node:
-                field_type = self._text(src, type_node)
-
-            if field_name:
-                return FieldInfo(name=field_name, type=field_type)
-
-        elif assignment.type == "annotated_assignment":
-            left = assignment.child_by_field_name("left")
-            type_node = assignment.child_by_field_name("type")
-
-            if left and left.type == "identifier":
-                field_name = self._text(src, left)
-                field_type = self._text(src, type_node) if type_node else None
-                return FieldInfo(name=field_name, type=field_type)
+        # Delegate to direct assignment parser if it's an assignment
+        if expr.type == "assignment":
+            return self._parse_direct_assignment(expr, src)
 
         return None
 
