@@ -22,7 +22,8 @@ class FunctionInfo:
     name: str
     qualified_name: str
     module: str
-    params: List[str] = field(default_factory=list)
+    params: List[Dict[str, Optional[str]]] = field(default_factory=list)
+    return_type: Optional[str] = None
     docstring: str = ""
     calls: List[str] = field(default_factory=list)
     complexity: int = 1
@@ -33,7 +34,7 @@ class FunctionInfo:
 class ClassInfo:
     name: str
     module: str
-    methods: List[str] = field(default_factory=list)
+    methods: List[FunctionInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -59,7 +60,7 @@ class PythonAnalyzer:
     def scan_files(self) -> List[Path]:
         files: List[Path] = []
         for root, dirs, filenames in os.walk(self.repo_path):
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
             for fname in filenames:
                 path = Path(root) / fname
                 if path.suffix in PY_EXTENSIONS:
@@ -140,23 +141,43 @@ class PythonAnalyzer:
 
     def _parse_class(self, node: Node, src: bytes, module: str) -> ClassInfo:
         name = self._text(src, node.child_by_field_name("name"))
-        methods: List[str] = []
+        methods: List[FunctionInfo] = []
         body = node.child_by_field_name("body")
         if body:
             for n in body.children:
                 if n.type == "function_definition":
-                    mname = self._text(src, n.child_by_field_name("name"))
-                    methods.append(mname)
+                    method_info = self._parse_function(n, src, module, class_name=name)
+                    methods.append(method_info)
         return ClassInfo(name=name, module=module, methods=methods)
 
-    def _parse_function(self, node: Node, src: bytes, module: str) -> FunctionInfo:
+    def _parse_function(self, node: Node, src: bytes, module: str, class_name: Optional[str] = None) -> FunctionInfo:
         name = self._text(src, node.child_by_field_name("name"))
         params_node = node.child_by_field_name("parameters")
-        params: List[str] = []
+        params: List[Dict[str, Optional[str]]] = []
         if params_node:
             for ch in params_node.children:
                 if ch.type == "identifier":
-                    params.append(self._text(src, ch))
+                    params.append({"name": self._text(src, ch), "type": None})
+                elif ch.type == "typed_parameter":
+                    p_name = self._text(src, ch.child_by_field_name("name"))
+                    p_type = ch.child_by_field_name("type")
+                    type_str = self._text(src, p_type) if p_type else None
+                    params.append({"name": p_name, "type": type_str})
+                elif ch.type == "default_parameter":
+                    p_name = self._text(src, ch.child_by_field_name("name"))
+                    params.append({"name": p_name, "type": None})
+                elif ch.type == "typed_default_parameter":
+                    p_name = self._text(src, ch.child_by_field_name("name"))
+                    p_type = ch.child_by_field_name("type")
+                    type_str = self._text(src, p_type) if p_type else None
+                    params.append({"name": p_name, "type": type_str})
+                elif ch.type == "list_splat_pattern":
+                    params.append({"name": self._text(src, ch), "type": None})
+                elif ch.type == "dictionary_splat_pattern":
+                    params.append({"name": self._text(src, ch), "type": None})
+        return_type_node = node.child_by_field_name("return_type")
+        return_type = self._text(src, return_type_node) if return_type_node else None
+
         body = node.child_by_field_name("body")
         calls: List[str] = []
         docstring = ""
@@ -171,7 +192,8 @@ class PythonAnalyzer:
                 txt = self._text(src, body.children[0])
                 if txt.startswith(('"""', "''")):
                     docstring = txt.strip('"\'')
-        return FunctionInfo(name=name, qualified_name=f"{module}.{name}", module=module, params=params, docstring=docstring, calls=calls, complexity=complexity, nesting=nesting)
+        qualified_name = f"{module}.{class_name}.{name}" if class_name else f"{module}.{name}"
+        return FunctionInfo(name=name, qualified_name=qualified_name, module=module, params=params, return_type=return_type, docstring=docstring, calls=calls, complexity=complexity, nesting=nesting)
 
     def _iter_nodes(self, node: Optional[Node]):
         if node is None:
@@ -209,7 +231,7 @@ class PythonAnalyzer:
 def build_structure_tree(repo_path: Path) -> Dict:
     tree: Dict = {}
     for root, dirs, files in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
         rel = Path(root).relative_to(repo_path)
         cur = tree
         for part in rel.parts:
@@ -332,7 +354,7 @@ def main() -> None:
     business_logic = [f.qualified_name for f in all_functions if classify_module(f.module) != "utility" and fan_map[f.qualified_name]["fan_out"] >= 2 and any(e.lower() in " ".join(f.calls).lower() for e in business_entities)]
 
     uml = {
-        "classes": [{"name": c.name, "module": c.module, "methods": c.methods} for c in all_classes],
+        "classes": [{"name": c.name, "module": c.module, "methods": [{"name": m.name, "params": m.params, "return_type": m.return_type} for m in c.methods]} for c in all_classes],
         "relations": [{"from": u, "to": v, "type": "module_dep"} for u, v in dep_graph.edges],
     }
 
@@ -370,16 +392,31 @@ def main() -> None:
     for d in dead_code:
         refactoring.append({"type": "remove_dead_code", "target": d})
 
+    def _filter_internal_imports(imports: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        return [imp for imp in imports if imp["module"].split(".")[0] in internal_modules]
+
+    def _filter_internal_calls(calls: List[str], mod_imports: List[Dict[str, str]]) -> List[str]:
+        mod_import_alias = {i["alias"] or i["name"]: i["module"] for i in mod_imports}
+        internal_calls = []
+        for call in calls:
+            base = call.split("(")[0].strip().split(".")[0]
+            if base in mod_import_alias:
+                if mod_import_alias[base].split(".")[0] in internal_modules:
+                    internal_calls.append(call)
+            elif call.split(".")[0] in internal_modules or call in analyzer.symbol_functions:
+                internal_calls.append(call)
+        return internal_calls
+
     output = {
         "project": {
             "name": repo_path.name,
             "path": str(repo_path),
             "structure": build_structure_tree(repo_path),
         },
-        "modules": [{"name": m.name, "path": m.path, "imports": m.imports, "comments": m.comments} for m in analyzer.modules.values()],
+        "modules": [{"name": m.name, "path": m.path, "imports": _filter_internal_imports(m.imports), "comments": m.comments} for m in analyzer.modules.values()],
         "symbols": {
-            "functions": [f.__dict__ for f in all_functions],
-            "classes": [c.__dict__ for c in all_classes],
+            "functions": [{**f.__dict__, "calls": _filter_internal_calls(f.calls, analyzer.modules[f.module].imports)} for f in all_functions],
+            "classes": [{"name": c.name, "module": c.module, "methods": [m.__dict__ for m in c.methods]} for c in all_classes],
             "globals": globals_out,
         },
         "business_entities": business_entities,
